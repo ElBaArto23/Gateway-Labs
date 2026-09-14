@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI Logistics Assistant · Trigger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+
+<div class="tower">
+
+  <header class="tower-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div class="brand-text">
+        <h1>AI Logistics Assistant</h1>
+        <p>Chat de prueba &middot; APIM &rarr; Azure AI Foundry</p>
+      </div>
+    </div>
+    <div class="gateway-status" id="gateway-status">
+      <span class="status-dot" id="status-dot"></span>
+      <span id="status-label">Verificando gateway&hellip;</span>
+    </div>
+  </header>
+
+  <div class="heartbeat" aria-hidden="true"><div class="heartbeat-pulse" id="heartbeat-pulse"></div></div>
+
+  <main class="tower-main">
+    <section class="chat-panel">
+      <div class="panel-label">
+        <span class="eyebrow">Consola de prueba</span>
+        <h2>Consulta operativa</h2>
+        <p class="panel-hint">
+          Cada mensaje viaja real por APIM hasta <strong>{{ model_name }}</strong>.
+          Las métricas (costo, tokens, latencia) se registran en tu dashboard
+          — ábrelo aparte para verlas.
+        </p>
+      </div>
+
+      <div class="chat-log" id="chat-log">
+        <div class="msg msg-system">
+          <p>Escribe una incidencia, consulta operativa o solicitud de reporte. Esta pantalla es solo el disparador: la evidencia de consumo real se ve en tu dashboard.</p>
+        </div>
+      </div>
+
+      <form class="chat-form" id="chat-form">
+        <textarea
+          id="chat-input"
+          placeholder="Ej: Analiza un error HTTP 502 al consumir una API a través de Azure API Management"
+          rows="2"
+          required
+        ></textarea>
+        <button type="submit" id="send-btn">
+          <span class="send-label">Enviar</span>
+          <span class="send-spinner" aria-hidden="true"></span>
+        </button>
+      </form>
+
+      <div class="quick-actions">
+        <button type="button" class="quick-btn" data-prompt="Analiza un error HTTP 502 en Azure API Management y cómo solucionarlo.">Error 502</button>
+        <button type="button" class="quick-btn" data-prompt="Propón mejoras para reducir tiempos de entrega en Bogotá.">Optimizar rutas</button>
+        <button type="button" class="quick-btn" data-prompt="Resume las incidencias registradas durante la semana.">Reporte semanal</button>
+      </div>
+
+      {% if not apim_configured %}
+      <div class="config-warning">
+        ⚠️ El backend no detecta <code>APIM_ENDPOINT</code> / <code>APIM_SUBSCRIPTION_KEY</code> en el <code>.env</code>. Configúralos antes de enviar mensajes.
+      </div>
+      {% endif %}
+    </section>
+  </main>
+</div>
+
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>

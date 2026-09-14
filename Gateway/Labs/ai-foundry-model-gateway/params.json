@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "sharedApimName": {
+      "value": "apim-shared-pdcibwky2f5ms"
+    },
+    "sharedApimResourceGroupName": {
+      "value": "rg-shared-apim-gateway-V2"
+    },
+    "sharedApimSubscriptionName": {
+      "value": "shared-subscription"
+    },
+    "aiServicesConfig": {
+      "value": [
+        {
+          "name": "models-foundry",
+          "location": "swedencentral",
+          "weight": 1
+        },
+        {
+          "name": "agents-foundry",
+          "location": "swedencentral",
+          "weight": 0
+        }
+      ]
+    },
+    "modelsConfig": {
+      "value": [
+        {
+          "name": "gpt-5.4-mini",
+          "publisher": "OpenAI",
+          "version": "2026-03-17",
+          "sku": "GlobalStandard",
+          "capacity": 10,
+          "aiservice": "models-foundry"
+        },
+        {
+          "name": "gpt-5.4",
+          "publisher": "OpenAI",
+          "version": "2026-03-05",
+          "sku": "GlobalStandard",
+          "capacity": 10,
+          "aiservice": "models-foundry"
+        }
+      ]
+    },
+    "inferenceAPIPath": {
+      "value": "inference"
+    },
+    "inferenceAPIType": {
+      "value": "PassThrough"
+    },
+    "foundryProjectName": {
+      "value": "foundry-project"
+    }
+  }
+}

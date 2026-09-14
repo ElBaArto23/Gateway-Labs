@@ -1,0 +1,15 @@
+{
+  "name": "gemini-models-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI Gateway playground/dashboard for the gemini-models lab — Azure App Service frontend with server-side subscription keys.",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}

@@ -1,0 +1,87 @@
+<policies>
+    <inbound>
+        <base />
+        
+        <!-- ======================================================= -->
+        <!-- 🚦 PRUEBA 1: Rate Limiting (Fase 1)                     -->
+        <!-- Máximo 3 llamadas por minuto por Subscription Key       -->
+        <!-- ======================================================= -->
+        <rate-limit-by-key calls="3" 
+                           renewal-period="60" 
+                           counter-key="@(context.Subscription.Id)" />
+
+        <!-- ======================================================= -->
+        <!-- 💾 PRUEBA 3: Caching (Fase 1)                           -->
+        <!-- Busca si el mismo Prompt/Payload ya fue respondido      -->
+        <!-- ======================================================= -->
+        <!-- 'vary-by-developer-specific-plans' se sacó: no es un atributo real de cache-lookup
+             en el schema de la APIM compartida V2. En su lugar, el schema actual exige
+             'vary-by-developer-groups' (obligatorio junto con vary-by-developer). Ambos en
+             "false" preservan el comportamiento original (no varía el caché por developer
+             ni por sus grupos). -->
+        <cache-lookup vary-by-developer="false"
+                      vary-by-developer-groups="false"
+                      allow-private-response-caching="true"
+                      must-revalidate="false"
+                      downstream-caching-type="none">
+            <vary-by-header>Accept</vary-by-header>
+            <vary-by-header>Content-Type</vary-by-header>
+        </cache-lookup>
+
+        <!-- 1. Autenticación Managed Identity -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" output-token-variable-name="managed-id-access-token" ignore-error="false" />
+        
+        <!-- 2. Encabezado de Autorización -->
+        <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["managed-id-access-token"])</value>
+        </set-header>
+
+        <!-- 3. Enrutamiento al Backend -->
+        <set-backend-service backend-id="{backend-id}" />
+
+        <!-- 4. Límite de Tokens por minuto (Control de costes) -->
+        <azure-openai-token-limit
+            counter-key="@(context.Subscription.Id)"
+            tokens-per-minute="10000"
+            estimate-prompt-tokens="true"
+            remaining-tokens-variable-name="remainingTokens" />
+
+        <!-- 5. Telemetría de Tokens hacia Application Insights -->
+        <azure-openai-emit-token-metric namespace="AIGatewayMetrics">
+            <dimension name="Subscription ID" value="@(context.Subscription.Id)" />
+            <dimension name="Subscription Name" value="@(context.Subscription.Name)" />
+            <dimension name="API ID" value="@(context.Api.Id)" />
+            <dimension name="Client IP" value="@(context.Request.IpAddress)" />
+            <dimension name="Deployment Model" value="@(context.Request.MatchedParameters.GetValueOrDefault(&quot;deployment-id&quot;, &quot;unknown&quot;))" />
+        </azure-openai-emit-token-metric>
+    </inbound>
+    
+    <backend>
+        <!-- ======================================================= -->
+        <!-- 🔄 PRUEBA 6: Retries (Fase 1)                           -->
+        <!-- Reintenta si el backend devuelve 429 o 5xx              -->
+        <!-- ======================================================= -->
+        <!-- Nota: no se incluye <base /> aquí porque ya implica un  -->
+        <!-- forward-request implícito; combinarlo con <retry> causa -->
+        <!-- el error "backend section allows only one policy".      -->
+        <retry condition="@(context.Response.StatusCode == 429 || context.Response.StatusCode >= 500)" 
+               count="3" 
+               interval="2" 
+               first-fast-retry="true">
+            <forward-request timeout="15" />
+        </retry>
+    </backend>
+    
+    <outbound>
+        <base />
+        <!-- ======================================================= -->
+        <!-- 💾 PRUEBA 3 (Parte 2): Guarda en Caché la respuesta     -->
+        <!-- Almacena en memoria por 300 segundos (5 min)            -->
+        <!-- ======================================================= -->
+        <cache-store duration="300" />
+    </outbound>
+    
+    <on-error>
+        <base />
+    </on-error>
+</policies>

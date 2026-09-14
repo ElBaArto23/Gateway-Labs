@@ -1,0 +1,10 @@
+[project]
+name = "ai-logistics-assistant"
+version = "0.1.0"
+description = "Aplicación web (Flask + HTML/JS) que consume Azure AI Foundry a través de Azure API Management (Model Gateway)."
+requires-python = ">=3.10"
+dependencies = [
+    "flask>=3.0.3",
+    "requests>=2.32.3",
+    "python-dotenv>=1.0.1",
+]

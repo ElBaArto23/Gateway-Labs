@@ -1,0 +1,1 @@
+{"$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#", "contentVersion": "1.0.0.0", "parameters": {"appServicePlanSku": {"value": "B1"}, "subscription1Key": {"value": "0864fe2d2f03437cacd22fbb2d3cafd4"}, "subscription2Key": {"value": "244094fd5eab4749b5e9b3e48cf425c1"}, "subscription3Key": {"value": "743bd407575c4dff872cf200f509dacf"}}}
