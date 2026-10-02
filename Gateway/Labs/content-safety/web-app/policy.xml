@@ -1,0 +1,307 @@
+<policies>
+    <inbound>
+        <base />
+
+        <!--
+            Guardamos el texto del ultimo mensaje del usuario ANTES de pasar
+            por llm-content-safety, porque si esa policy bloquea la
+            solicitud, necesitamos el texto original para poder preguntarle
+            a Content Safety, en el on-error, cual fue exactamente la
+            categoria y severidad que lo dispararon (en vez de adivinarlo
+            con una expresion regular sobre un mensaje que Azure no
+            documenta con un formato estable).
+        -->
+        <set-variable name="originalPromptText" value="@{
+            try {
+                var body = context.Request.Body?.As<JObject>(true);
+                var messages = body != null ? body["messages"] as JArray : null;
+                if (messages != null && messages.Count > 0) {
+                    var last = messages[messages.Count - 1] as JObject;
+                    return last != null ? (last["content"]?.ToString() ?? "") : "";
+                }
+            } catch {
+            }
+            return "";
+        }" />
+
+        <!-- Backend del modelo LLM -->
+        <set-backend-service backend-id="{backend-id}" />
+
+        <!--
+            Azure AI Content Safety
+
+            - shield-prompt="false" (deshabilitado temporalmente mientras
+              se confirma un problema de disponibilidad del servicio de
+              Content Safety; ver notas en el repo/checklist):
+              Detecta ataques adversariales / prompt attacks.
+
+            - enforce-on-completions="true":
+              También valida la respuesta generada por el modelo
+              antes de entregarla al usuario. Esto aplica a CUALQUIER
+              modelo que responda por este gateway (gpt-5.6-luna y Phi-4
+              quedan cubiertos por igual, sin importar cuál conteste).
+
+            NOTA: el backend-id de abajo debe coincidir EXACTO con
+            el recurso contentSafetyBackend de main.bicep
+            (labPrefix-backend). Este archivo asume que este lab se
+            despliega con labPrefix = "content-safety" (el nombre de la
+            carpeta del lab) - si usas otro valor de labPrefix, actualiza
+            también esta línea.
+        -->
+        <!--
+            REACTIVADO (2026-09-18): la causa del "InternalError / Service
+            unavailable" NO era una caída de Azure AI Content Safety en sí;
+            era que el blocklist personalizado <blocklists><id>blocklist1
+            </id></blocklists> de abajo no existía en el recurso (se pierde
+            cada vez que se redespliega el lab, porque los blocklists viven
+            en el plano de datos de Content Safety, no en el Bicep/ARM).
+            Confirmado con diagnose.py: text:analyze SIN blocklistNames
+            responde 200 normal; CON blocklistNames=[blocklist1] inexistente
+            responde el mismo 500 genérico que veíamos aquí.
+
+            ⚠️ REQUISITO ANTES DE REDESPLEGAR ESTA POLICY: corre
+            provision_blocklist.py (o la celda equivalente del notebook)
+            contra el recurso de Content Safety de ESTE deployment, para que
+            "blocklist1" exista antes de que el gateway lo referencie. Si
+            reactivas este bloque sin haber corrido eso primero, vuelves a
+            ver el mismo bloqueo/503 falso en TODO el gateway, no solo en la
+            app web.
+        -->
+        <llm-content-safety
+            backend-id="content-safety-backend"
+            shield-prompt="false"
+            enforce-on-completions="true">
+
+            <categories output-type="EightSeverityLevels">
+
+                <!-- Bloquea severidad 4, 5, 6 y 7 en cada categoria -->
+                <category name="SelfHarm" threshold="4" />
+                <category name="Hate" threshold="4" />
+                <category name="Violence" threshold="4" />
+                <category name="Sexual" threshold="4" />
+
+            </categories>
+
+            <!-- Blocklist personalizada creada en Azure AI Content Safety -->
+            <blocklists>
+                <id>blocklist1</id>
+            </blocklists>
+
+        </llm-content-safety>
+
+    </inbound>
+
+
+    <backend>
+        <base />
+    </backend>
+
+
+    <outbound>
+        <base />
+
+        <!--
+            No necesitamos repetir llm-content-safety aquí,
+            porque enforce-on-completions="true" ya valida
+            las completions del modelo.
+        -->
+
+    </outbound>
+
+
+    <on-error>
+        <base />
+
+        <!--
+            Dos caminos distintos segun el tipo de error:
+
+            1) Error de INFRAESTRUCTURA del servicio de Content Safety
+               (InternalError, Service unavailable, Please try again later)
+               - esto NO es un bloqueo de contenido, es el servicio de
+               Azure fallando (o el blocklist no existe; ver nota de
+               arriba). Se devuelve un 503 honesto.
+
+            2) Bloqueo REAL de contenido (o cualquier otro error de
+               llm-content-safety que no sea de infraestructura) - aqui,
+               en vez de adivinar la categoria/severidad con una expresion
+               regular sobre el mensaje de error de Azure (que no tiene
+               formato documentado y nunca dio un match confiable en las
+               pruebas), la policy vuelve a preguntarle a Content Safety
+               DIRECTAMENTE, con el mismo texto original del usuario, cual
+               es la severidad real por categoria. Asi la respuesta final
+               nombra la categoria y la severidad exacta que violo la
+               politica, con datos verificados, no adivinados. Si esa
+               segunda consulta tambien falla (por ejemplo si Content
+               Safety sigue con problemas), se degrada con elegancia a una
+               respuesta profesional generica en vez de fallar.
+
+            NOTA TECNICA: el parser de politicas de APIM escanea todo el
+            archivo buscando el caracter arroba para detectar expresiones
+            de codigo, incluso dentro de comentarios XML. Por eso estos
+            comentarios evitan deliberadamente escribir ese caracter
+            seguido de parentesis o llave, para no romper la validacion
+            del deployment.
+        -->
+        <choose>
+            <when condition="@(context.LastError != null && context.LastError.Source == "llm-content-safety" && (context.LastError.Message ?? string.Empty).IndexOf("InternalError", StringComparison.OrdinalIgnoreCase) < 0 && (context.LastError.Message ?? string.Empty).IndexOf("Service unavailable", StringComparison.OrdinalIgnoreCase) < 0 && (context.LastError.Message ?? string.Empty).IndexOf("Please try again later", StringComparison.OrdinalIgnoreCase) < 0)">
+
+                <set-variable name="csRawMessage" value="@(context.LastError.Message ?? string.Empty)" />
+
+                <!--
+                    Consulta directa a Content Safety para obtener la
+                    categoria/severidad REAL que disparo el bloqueo. Usa el
+                    mismo backend (misma managed identity ya configurada en
+                    contentSafetyBackend), asi que no hace falta repetir
+                    autenticacion aqui.
+                -->
+                <!--
+                    send-request NO admite set-backend-service como hijo
+                    (solo set-url, set-method, set-header, set-body y los
+                    elementos de autenticacion) - por eso aqui se usa la URL
+                    absoluta de Content Safety, con el token
+                    {content-safety-endpoint} que main.bicep reemplaza por
+                    el endpoint real antes de desplegar, y se autentica con
+                    la managed identity de la APIM compartida (la misma que
+                    ya tiene el rol "Cognitive Services User" sobre este
+                    recurso de Content Safety).
+                -->
+                <send-request mode="new" response-variable-name="csAnalyzeResponse" timeout="8" ignore-error="true">
+                    <set-url>{content-safety-endpoint}contentsafety/text:analyze?api-version=2024-09-01</set-url>
+                    <set-method>POST</set-method>
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>@{
+                        var b = new JObject();
+                        b["text"] = (string)context.Variables.GetValueOrDefault<string>("originalPromptText", "");
+                        b["categories"] = new JArray("Hate", "SelfHarm", "Sexual", "Violence");
+                        b["outputType"] = "EightSeverityLevels";
+                        return b.ToString();
+                    }</set-body>
+                    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+                </send-request>
+
+                <set-variable name="csCategoriaBloqueo" value="@{
+                    try {
+                        var resp = ((IResponse)context.Variables["csAnalyzeResponse"]);
+                        if (resp == null || resp.StatusCode != 200) {
+                            return "";
+                        }
+                        var json = resp.Body.As<JObject>();
+                        var analysis = json["categoriesAnalysis"] as JArray;
+                        if (analysis == null) {
+                            return "";
+                        }
+                        string peorCategoria = "";
+                        int peorSeveridad = -1;
+                        foreach (var item in analysis) {
+                            int sev = (int)item["severity"];
+                            if (sev > peorSeveridad) {
+                                peorSeveridad = sev;
+                                peorCategoria = (string)item["category"];
+                            }
+                        }
+                        return peorCategoria;
+                    } catch {
+                        return "";
+                    }
+                }" />
+
+                <set-variable name="csSeveridadBloqueo" value="@{
+                    try {
+                        var resp = ((IResponse)context.Variables["csAnalyzeResponse"]);
+                        if (resp == null || resp.StatusCode != 200) {
+                            return -1;
+                        }
+                        var json = resp.Body.As<JObject>();
+                        var analysis = json["categoriesAnalysis"] as JArray;
+                        if (analysis == null) {
+                            return -1;
+                        }
+                        int peorSeveridad = -1;
+                        foreach (var item in analysis) {
+                            int sev = (int)item["severity"];
+                            if (sev > peorSeveridad) {
+                                peorSeveridad = sev;
+                            }
+                        }
+                        return peorSeveridad;
+                    } catch {
+                        return -1;
+                    }
+                }" />
+
+                <set-status code="403" reason="Blocked by Content Safety" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body>@{
+                    var categoria = context.Variables.GetValueOrDefault<string>("csCategoriaBloqueo", "");
+                    var severidad = context.Variables.GetValueOrDefault<int>("csSeveridadBloqueo", -1);
+                    var mensajeOriginal = context.Variables.GetValueOrDefault<string>("csRawMessage", "");
+
+                    var nombresCategoria = new JObject();
+                    nombresCategoria["SelfHarm"] = "autolesion";
+                    nombresCategoria["Hate"] = "discurso de odio";
+                    nombresCategoria["Violence"] = "violencia";
+                    nombresCategoria["Sexual"] = "contenido sexual";
+
+                    var umbrales = new JObject();
+                    umbrales["SelfHarm"] = 4;
+                    umbrales["Hate"] = 4;
+                    umbrales["Violence"] = 4;
+                    umbrales["Sexual"] = 4;
+
+                    string mensajeProfesional;
+                    bool tieneDatoConfiable = !string.IsNullOrEmpty(categoria) && severidad >= 0;
+
+                    if (tieneDatoConfiable) {
+                        string nombreLegible = nombresCategoria[categoria]?.ToString() ?? categoria;
+                        mensajeProfesional = $"Tu solicitud fue bloqueada porque el contenido evaluado alcanzo un nivel de severidad {severidad} en la categoria \"{nombreLegible}\", superando el umbral permitido de {umbrales[categoria]} configurado en la politica de seguridad de contenido de este servicio.";
+                    } else {
+                        mensajeProfesional = "Tu solicitud fue bloqueada por el filtro de seguridad de contenido de Azure AI Content Safety. No fue posible determinar con certeza la categoria y severidad exactas en este momento; el detalle original de Azure queda incluido para referencia.";
+                    }
+
+                    var body = new JObject();
+                    body["blocked"] = true;
+                    body["gateway"] = "APIM Content Safety Gateway";
+                    body["mensaje"] = mensajeProfesional;
+                    body["categoria_detectada"] = tieneDatoConfiable ? categoria : "No determinada";
+                    body["severidad_detectada"] = tieneDatoConfiable ? severidad.ToString() : "No determinada";
+                    body["escala_severidad"] = "EightSeverityLevels: 0 (nada) a 7 (extremo). Se bloquea desde el nivel 4 en adelante.";
+                    body["umbrales_configurados"] = umbrales;
+                    body["detalle_original_azure"] = mensajeOriginal;
+
+                    return body.ToString();
+                }</set-body>
+            </when>
+            <when condition="@(context.LastError != null && context.LastError.Source == "llm-content-safety")">
+                <!--
+                    Llegamos aqui solo si Source es llm-content-safety PERO
+                    es un error de servicio (InternalError, Service
+                    unavailable, Please try again later), no un bloqueo de
+                    contenido real. Se devuelve un 503 honesto, distinguible
+                    del 403 de arriba, para que el cliente sepa que puede
+                    reintentar.
+                -->
+                <set-status code="503" reason="Content Safety service temporarily unavailable" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body>@{
+                    var body = new JObject();
+                    body["blocked"] = false;
+                    body["servicio_no_disponible"] = true;
+                    body["gateway"] = "APIM Content Safety Gateway";
+                    body["mensaje"] = "El servicio de Azure AI Content Safety no respondió (error transitorio, no un bloqueo de contenido). Reintenta en unos segundos.";
+                    body["detalle_original_azure"] = context.LastError.Message ?? string.Empty;
+                    return body.ToString();
+                }</set-body>
+            </when>
+            <otherwise>
+                <!-- Cualquier otro error (no relacionado a content safety) sigue su curso normal -->
+            </otherwise>
+        </choose>
+
+    </on-error>
+</policies>

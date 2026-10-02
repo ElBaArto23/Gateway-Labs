@@ -1,0 +1,794 @@
+<policies>
+    <inbound>
+        <base />
+
+        <!--
+            ====================================================================
+            CONFIGURACION DEL ENRUTAMIENTO Y DEL NIVEL DE BLOQUEO
+            ====================================================================
+
+            Escala EightSeverityLevels: 0 (nada) a 7 (extremo).
+
+              Severidad maxima 0 en todas las categorias  -> modelo GRANDE
+              Severidad maxima entre 1 y (umbral - 1)     -> modelo PEQUENO
+              Severidad maxima >= umbral, o blocklist1,
+              o Prompt Shield detecta ataque               -> BLOQUEO 403
+
+            Umbral POR CATEGORIA (csUmbrales):
+              Hate      2  -> cualquier peticion de odio, aunque sea
+                              indirecta ("escribe un ataque degradante
+                              contra..."), se bloquea con el nivel visible.
+              Violence  3
+              Sexual    3
+              SelfHarm  3
+
+            Resultado:
+              todo en 0                          -> gpt-5.6-luna
+              Hate 1, u otra categoria en 1 o 2  -> Phi-4
+              alcanza el umbral de su categoria  -> bloqueo 403 con niveles
+
+            Si cambias csUmbrales, cambia tambien los threshold de
+            <categories> en llm-content-safety (mas abajo): ese atributo no
+            admite expresiones y tiene que ser un numero literal.
+
+            csBloquearNegativaConRiesgo: si la entrada tuvo algun nivel de
+            riesgo (1 o mas) y el modelo pequeno se nego a responder, el
+            gateway convierte esa respuesta en un 403 con los niveles
+            medidos, en vez de dejarla pasar como una negativa del modelo.
+            Asi el caso "MODEL_REFUSAL" queda registrado como bloqueo del
+            APIM. Con false, pasa como 200 y solo se marca en el header
+            x-cs-negativa-modelo.
+
+            modeloGrande y modeloPequeno son los NOMBRES DE DEPLOYMENT en
+            Foundry. Ambos deployments deben estar detras del mismo backend.
+        -->
+        <set-variable name="modeloGrande" value="gpt-5.6-luna" />
+        <set-variable name="modeloPequeno" value="Phi-4" />
+        <set-variable name="csUmbrales" value='@{
+            var u = new JObject();
+            u["Hate"] = 2;
+            u["Violence"] = 3;
+            u["Sexual"] = 3;
+            u["SelfHarm"] = 3;
+            return u;
+        }' />
+        <set-variable name="csBloquearNegativaConRiesgo" value="@(true)" />
+
+        <!--
+            Textos del prompt, usados para el analisis previo y para el
+            diagnostico del on-error.
+
+            - conversacion: texto de TODOS los mensajes (system, user,
+              assistant...), porque llm-content-safety evalua el prompt
+              completo, no solo el ultimo mensaje.
+            - ultimo_usuario: el ultimo mensaje con role "user", que se envia
+              a Prompt Shield como userPrompt.
+
+            content puede ser un string o un arreglo de partes
+            ([{ "type": "text", "text": "..." }, ...]). Las partes que no son
+            texto se ignoran. Ambos textos se recortan a los ultimos 10000
+            caracteres, el maximo que acepta la API por llamada.
+        -->
+        <set-variable name="csTextosPrompt" value='@{
+            var r = new JObject();
+            r["conversacion"] = "";
+            r["ultimo_usuario"] = "";
+            try {
+                var body = context.Request.Body?.As&lt;JObject&gt;(true);
+                var messages = body != null ? body["messages"] as JArray : null;
+                if (messages != null) {
+                    var todo = new System.Text.StringBuilder();
+                    string ultimoUsuario = "";
+                    foreach (var t in messages) {
+                        var m = t as JObject;
+                        if (m == null) {
+                            continue;
+                        }
+                        var c = m["content"];
+                        string texto = "";
+                        if (c != null) {
+                            if (c.Type == JTokenType.String) {
+                                texto = (string)c;
+                            } else if (c.Type == JTokenType.Array) {
+                                var partes = new System.Text.StringBuilder();
+                                foreach (var p in (JArray)c) {
+                                    var po = p as JObject;
+                                    if (po != null &amp;&amp; (string)po["type"] == "text") {
+                                        partes.AppendLine((string)po["text"] ?? "");
+                                    }
+                                }
+                                texto = partes.ToString();
+                            }
+                        }
+                        if (string.IsNullOrWhiteSpace(texto)) {
+                            continue;
+                        }
+                        todo.AppendLine(texto);
+                        if ((string)m["role"] == "user") {
+                            ultimoUsuario = texto;
+                        }
+                    }
+                    int max = 10000;
+                    string conv = todo.ToString();
+                    if (conv.Length &gt; max) {
+                        conv = conv.Substring(conv.Length - max);
+                    }
+                    if (ultimoUsuario.Length &gt; max) {
+                        ultimoUsuario = ultimoUsuario.Substring(ultimoUsuario.Length - max);
+                    }
+                    r["conversacion"] = conv;
+                    r["ultimo_usuario"] = ultimoUsuario;
+                }
+            } catch {
+            }
+            return r;
+        }' />
+
+        <!--
+            Si la solicitud es streaming no se analiza la salida en el
+            outbound, porque leer el cuerpo romperia el stream.
+        -->
+        <set-variable name="esStream" value='@{
+            try {
+                var b = context.Request.Body?.As&lt;JObject&gt;(true);
+                return b != null &amp;&amp; b["stream"] != null &amp;&amp; b["stream"].Type == JTokenType.Boolean &amp;&amp; (bool)b["stream"];
+            } catch {
+                return false;
+            }
+        }' />
+
+        <!--
+            ANALISIS PREVIO de la entrada, en TODAS las solicitudes (no solo
+            en las bloqueadas). Sirve para dos cosas:
+              1) Decidir el modelo segun la severidad.
+              2) Exponer el nivel de cada categoria aunque no haya bloqueo
+                 (header x-cs-severidad-entrada en la respuesta).
+
+            El on-error reutiliza esta misma respuesta (csAnalyzeResponse)
+            en vez de volver a consultar. Solo repite la consulta si esta
+            fallo.
+
+            Costo: una llamada extra a Content Safety por solicitud (del orden
+            de cientos de ms).
+        -->
+        <send-request mode="new" response-variable-name="csAnalyzeResponse" timeout="8" ignore-error="true">
+            <set-url>{content-safety-endpoint}contentsafety/text:analyze?api-version=2024-09-01</set-url>
+            <set-method>POST</set-method>
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+            </set-header>
+            <set-body><![CDATA[@{
+                var textos = context.Variables.GetValueOrDefault<JObject>("csTextosPrompt", new JObject());
+                var b = new JObject();
+                b["text"] = (string)textos["conversacion"] ?? "";
+                b["categories"] = new JArray("Hate", "SelfHarm", "Sexual", "Violence");
+                b["outputType"] = "EightSeverityLevels";
+                b["blocklistNames"] = new JArray("blocklist1");
+                b["haltOnBlocklistHit"] = false;
+                return b.ToString();
+            }]]></set-body>
+            <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+        </send-request>
+
+        <set-variable name="csPre" value='@{
+            var r = new JObject();
+            var porCategoria = new JObject();
+            var coincidencias = new JArray();
+            int maxSev = -1;
+            string maxCat = "";
+            bool ok = false;
+            try {
+                IResponse resp = context.Variables.ContainsKey("csAnalyzeResponse") ? (IResponse)context.Variables["csAnalyzeResponse"] : null;
+                if (resp != null &amp;&amp; resp.StatusCode == 200) {
+                    var json = resp.Body.As&lt;JObject&gt;(true);
+                    var analysis = json["categoriesAnalysis"] as JArray;
+                    if (analysis != null) {
+                        ok = true;
+                        foreach (var item in analysis) {
+                            int sev = (int)item["severity"];
+                            string cat = (string)item["category"];
+                            porCategoria[cat] = sev;
+                            if (sev &gt; maxSev) {
+                                maxSev = sev;
+                                maxCat = cat;
+                            }
+                        }
+                    }
+                    var matches = json["blocklistsMatch"] as JArray;
+                    if (matches != null) {
+                        foreach (var m in matches) {
+                            coincidencias.Add((string)m["blocklistItemText"]);
+                        }
+                    }
+                }
+            } catch {
+            }
+            r["ok"] = ok;
+            r["max_severidad"] = maxSev;
+            r["categoria_max"] = maxCat;
+            r["por_categoria"] = porCategoria;
+            r["blocklist"] = coincidencias;
+            return r;
+        }' />
+
+        <!--
+            Nivel de riesgo de la entrada:
+              limpio           -> todas las severidades en 0
+              riesgo_leve      -> alguna severidad entre 1 y umbral-1
+              bloqueo_esperado -> severidad >= umbral o coincidencia de
+                                  blocklist1 (llm-content-safety lo bloqueara)
+              sin_analisis     -> fallo la consulta previa; por precaucion
+                                  va al modelo pequeno
+        -->
+        <set-variable name="csNivel" value='@{
+            var p = (JObject)context.Variables["csPre"];
+            var umbrales = (JObject)context.Variables["csUmbrales"];
+            if (!(bool)p["ok"]) {
+                return "sin_analisis";
+            }
+            int maxSev = (int)p["max_severidad"];
+            if (((JArray)p["blocklist"]).Count &gt; 0) {
+                return "bloqueo_esperado";
+            }
+            foreach (var prop in ((JObject)p["por_categoria"]).Properties()) {
+                int umbral = umbrales[prop.Name] != null ? (int)umbrales[prop.Name] : 3;
+                if ((int)prop.Value &gt;= umbral) {
+                    return "bloqueo_esperado";
+                }
+            }
+            if (maxSev &gt;= 1) {
+                return "riesgo_leve";
+            }
+            return "limpio";
+        }' />
+
+        <set-variable name="modeloDestino" value='@{
+            string nivel = (string)context.Variables["csNivel"];
+            return nivel == "limpio" ? (string)context.Variables["modeloGrande"] : (string)context.Variables["modeloPequeno"];
+        }' />
+
+        <!-- Backend del modelo LLM -->
+        <set-backend-service backend-id="{backend-id}" />
+
+        <!--
+            ENRUTAMIENTO AL MODELO. Se cubren los dos formatos de llamada:
+              a) Campo "model" en el cuerpo (API de inferencia de modelos /
+                 OpenAI v1): se reemplaza su valor.
+              b) Ruta /deployments/{deployment-id}/... (Azure OpenAI): se
+                 reescribe la URL al deployment elegido.
+            Esto sobrescribe el modelo que haya elegido la app: la decision
+            final la toma el gateway, y se informa en el header
+            x-cs-modelo-enrutado.
+        -->
+        <set-body><![CDATA[@{
+            try {
+                var b = context.Request.Body.As<JObject>(true);
+                if (b != null && b["model"] != null) {
+                    b["model"] = (string)context.Variables["modeloDestino"];
+                }
+                return b != null ? b.ToString() : context.Request.Body.As<string>(true);
+            } catch {
+                return context.Request.Body != null ? context.Request.Body.As<string>(true) : "";
+            }
+        }]]></set-body>
+
+        <choose>
+            <when condition='@(context.Operation != null &amp;&amp; context.Operation.UrlTemplate != null &amp;&amp; context.Operation.UrlTemplate.Contains("{deployment-id}"))'>
+                <rewrite-uri template='@(context.Operation.UrlTemplate.Replace("{deployment-id}", (string)context.Variables["modeloDestino"]))' copy-unmatched-params="true" />
+            </when>
+        </choose>
+
+        <!--
+            Azure AI Content Safety (bloqueo real).
+
+            - Umbrales (antes 4 en todas): Hate 2, el resto 3.
+              Deben ser iguales a csUmbrales.
+            - shield-prompt="true": Prompt Shield antes de llegar al modelo.
+            - enforce-on-completions="true": tambien valida la respuesta.
+            - blocklist1 bloquea siempre que haya coincidencia.
+
+            ⚠️ blocklist1 debe existir en el recurso de Content Safety y tener
+            sus terminos cargados. Si no existe, Content Safety responde 500
+            en todas las solicitudes y el on-error lo devuelve como 503.
+        -->
+        <llm-content-safety
+            backend-id="content-safety-backend"
+            shield-prompt="true"
+            enforce-on-completions="true">
+
+            <categories output-type="EightSeverityLevels">
+                <category name="SelfHarm" threshold="3" />
+                <category name="Hate" threshold="2" />
+                <category name="Violence" threshold="3" />
+                <category name="Sexual" threshold="3" />
+            </categories>
+
+            <blocklists>
+                <id>blocklist1</id>
+            </blocklists>
+
+        </llm-content-safety>
+
+    </inbound>
+
+
+    <backend>
+        <base />
+    </backend>
+
+
+    <outbound>
+        <base />
+
+        <!--
+            Niveles visibles tambien en solicitudes PERMITIDAS, como headers:
+
+              x-cs-nivel                  limpio | riesgo_leve | sin_analisis
+              x-cs-modelo-enrutado        deployment al que se envio
+              x-cs-severidad-entrada      {"Hate":1,"SelfHarm":0,...}
+              x-cs-severidad-max-entrada  "Hate:1"
+              x-cs-blocklist-entrada      coincidencias de blocklist1 (JSON)
+              x-cs-severidad-salida       igual que la entrada, sobre la
+                                          respuesta del modelo (solo si no es
+                                          streaming)
+              x-cs-umbral                 umbral de bloqueo configurado
+        -->
+        <set-header name="x-cs-nivel" exists-action="override">
+            <value>@((string)context.Variables["csNivel"])</value>
+        </set-header>
+        <set-header name="x-cs-modelo-enrutado" exists-action="override">
+            <value>@((string)context.Variables["modeloDestino"])</value>
+        </set-header>
+        <set-header name="x-cs-severidad-entrada" exists-action="override">
+            <value>@(((JObject)context.Variables["csPre"])["por_categoria"].ToString(Newtonsoft.Json.Formatting.None))</value>
+        </set-header>
+        <set-header name="x-cs-severidad-max-entrada" exists-action="override">
+            <value>@{
+                var p = (JObject)context.Variables["csPre"];
+                return (string)p["categoria_max"] + ":" + (int)p["max_severidad"];
+            }</value>
+        </set-header>
+        <set-header name="x-cs-blocklist-entrada" exists-action="override">
+            <value>@(((JObject)context.Variables["csPre"])["blocklist"].ToString(Newtonsoft.Json.Formatting.None))</value>
+        </set-header>
+        <set-header name="x-cs-umbral" exists-action="override">
+            <value>@(((JObject)context.Variables["csUmbrales"]).ToString(Newtonsoft.Json.Formatting.None))</value>
+        </set-header>
+
+        <!-- Severidad de la RESPUESTA del modelo (solo si no es streaming) -->
+        <choose>
+            <when condition='@(context.Response.StatusCode == 200 &amp;&amp; !(bool)context.Variables["esStream"])'>
+                <set-variable name="csTextoRespuesta" value='@{
+                    try {
+                        var b = context.Response.Body.As&lt;JObject&gt;(true);
+                        string t = (string)b["choices"]?[0]?["message"]?["content"] ?? "";
+                        if (t.Length &gt; 10000) {
+                            t = t.Substring(t.Length - 10000);
+                        }
+                        return t;
+                    } catch {
+                        return "";
+                    }
+                }' />
+                <choose>
+                    <when condition='@(!string.IsNullOrWhiteSpace((string)context.Variables["csTextoRespuesta"]))'>
+                        <send-request mode="new" response-variable-name="csSalidaResponse" timeout="8" ignore-error="true">
+                            <set-url>{content-safety-endpoint}contentsafety/text:analyze?api-version=2024-09-01</set-url>
+                            <set-method>POST</set-method>
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body><![CDATA[@{
+                                var b = new JObject();
+                                b["text"] = (string)context.Variables["csTextoRespuesta"];
+                                b["categories"] = new JArray("Hate", "SelfHarm", "Sexual", "Violence");
+                                b["outputType"] = "EightSeverityLevels";
+                                return b.ToString();
+                            }]]></set-body>
+                            <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+                        </send-request>
+                        <set-header name="x-cs-severidad-salida" exists-action="override">
+                            <value><![CDATA[@{
+                                var porCategoria = new JObject();
+                                try {
+                                    IResponse resp = context.Variables.ContainsKey("csSalidaResponse") ? (IResponse)context.Variables["csSalidaResponse"] : null;
+                                    if (resp != null && resp.StatusCode == 200) {
+                                        var json = resp.Body.As<JObject>(true);
+                                        var analysis = json["categoriesAnalysis"] as JArray;
+                                        if (analysis != null) {
+                                            foreach (var item in analysis) {
+                                                porCategoria[(string)item["category"]] = (int)item["severity"];
+                                            }
+                                        }
+                                    }
+                                } catch {
+                                }
+                                return porCategoria.ToString(Newtonsoft.Json.Formatting.None);
+                            }]]></value>
+                        </set-header>
+                    </when>
+                </choose>
+            </when>
+        </choose>
+
+        <!--
+            NEGATIVA DEL MODELO.
+            Se detecta por frases al inicio de la respuesta (la API no trae
+            un campo estructurado para esto), igual que hace la app.
+
+            - Entrada limpia + negativa: se deja pasar como 200 y se marca
+              x-cs-negativa-modelo: true.
+            - Entrada con riesgo (nivel 1 o mas) + negativa, con
+              csBloquearNegativaConRiesgo = true: el gateway lo convierte en
+              un 403 con causa "negativa_del_modelo_con_riesgo" y los niveles
+              medidos. El modelo ya confirmo que el contenido no era
+              aceptable, asi que el APIM lo registra como bloqueo.
+        -->
+        <set-variable name="csEsNegativa" value='@{
+            if (!context.Variables.ContainsKey("csTextoRespuesta")) {
+                return false;
+            }
+            string t = ((string)context.Variables["csTextoRespuesta"] ?? "").Trim().ToLowerInvariant();
+            if (t.Length == 0) {
+                return false;
+            }
+            if (t.Length &gt; 250) {
+                t = t.Substring(0, 250);
+            }
+            string[] frases = new string[] {
+                "lo siento", "no puedo", "no voy a", "no es posible ayudarte", "no puedo ayudar",
+                "no puedo cumplir", "no puedo crear", "no puedo escribir", "no me es posible",
+                "i&apos;m sorry", "i am sorry", "i can&apos;t", "i cannot", "i won&apos;t", "i will not", "sorry, but"
+            };
+            foreach (var f in frases) {
+                if (t.Contains(f)) {
+                    return true;
+                }
+            }
+            return false;
+        }' />
+
+        <choose>
+            <when condition='@((bool)context.Variables["csEsNegativa"] &amp;&amp; (bool)context.Variables["csBloquearNegativaConRiesgo"] &amp;&amp; (string)context.Variables["csNivel"] != "limpio")'>
+                <return-response>
+                    <set-status code="403" reason="Blocked by Content Safety" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-header name="x-cs-nivel" exists-action="override">
+                        <value>@((string)context.Variables["csNivel"])</value>
+                    </set-header>
+                    <set-header name="x-cs-modelo-enrutado" exists-action="override">
+                        <value>@((string)context.Variables["modeloDestino"])</value>
+                    </set-header>
+                    <set-body><![CDATA[@{
+                        var p = (JObject)context.Variables["csPre"];
+                        var umbrales = (JObject)context.Variables["csUmbrales"];
+                        var nombres = new JObject();
+                        nombres["SelfHarm"] = "autolesion";
+                        nombres["Hate"] = "discurso de odio";
+                        nombres["Violence"] = "violencia";
+                        nombres["Sexual"] = "contenido sexual";
+
+                        string cat = (string)p["categoria_max"] ?? "";
+                        int sev = (int)p["max_severidad"];
+                        string nombre = nombres[cat]?.ToString() ?? cat;
+                        int umbral = umbrales[cat] != null ? (int)umbrales[cat] : 3;
+
+                        var maxEntrada = new JObject();
+                        maxEntrada["categoria"] = string.IsNullOrEmpty(cat) ? "No determinada" : cat;
+                        maxEntrada["severidad"] = sev;
+
+                        var body = new JObject();
+                        body["blocked"] = true;
+                        body["gateway"] = "APIM Content Safety Gateway";
+                        body["causa_bloqueo"] = "negativa_del_modelo_con_riesgo";
+                        body["causas_detectadas"] = new JArray("negativa_del_modelo_con_riesgo");
+                        body["mensaje"] = (string)context.Variables["csNivel"] == "sin_analisis"
+                            ? "Tu solicitud fue bloqueada por el gateway: no se pudo medir la severidad de la entrada y el modelo se nego a responder."
+                            : $"Tu solicitud fue bloqueada por el gateway: la entrada tiene riesgo de nivel {sev} en la categoria \"{nombre}\" (umbral de bloqueo directo: {umbral}) y el modelo {(string)context.Variables["modeloDestino"]} se nego a responder, lo que confirma que el contenido solicitado no es aceptable.";
+                        body["categoria_detectada"] = string.IsNullOrEmpty(cat) ? "No determinada" : cat;
+                        body["severidad_detectada"] = sev >= 0 ? sev.ToString() : "No determinada";
+                        body["severidad_maxima_entrada"] = maxEntrada;
+                        body["severidades_por_categoria"] = p["por_categoria"];
+                        body["blocklist_coincidencias"] = p["blocklist"];
+                        body["prompt_shield_ataque"] = false;
+                        body["diagnostico_completo"] = (bool)p["ok"];
+                        body["nivel_riesgo"] = (string)context.Variables["csNivel"];
+                        body["modelo_enrutado"] = (string)context.Variables["modeloDestino"];
+                        body["negativa_del_modelo"] = true;
+                        body["escala_severidad"] = "EightSeverityLevels: 0 (nada) a 7 (extremo). Se bloquea cuando la severidad es igual o mayor al umbral de su categoria.";
+                        body["umbrales_configurados"] = umbrales;
+                        return body.ToString();
+                    }]]></set-body>
+                </return-response>
+            </when>
+        </choose>
+
+        <set-header name="x-cs-negativa-modelo" exists-action="override">
+            <value>@(((bool)context.Variables["csEsNegativa"]) ? "true" : "false")</value>
+        </set-header>
+
+    </outbound>
+
+
+    <on-error>
+        <base />
+
+        <!--
+            Dos caminos segun el tipo de error:
+
+            1) Error de INFRAESTRUCTURA de Content Safety (InternalError,
+               Service unavailable, Please try again later): se devuelve 503.
+
+            2) Bloqueo REAL de contenido (403). El diagnostico reutiliza el
+               analisis previo del inbound (csAnalyzeResponse) y solo vuelve a
+               consultar text:analyze si ese analisis fallo. Prompt Shield si
+               se consulta aqui, porque el inbound no lo analiza por separado.
+
+               causa_bloqueo:
+                 - categoria_entrada: alguna severidad alcanza su umbral.
+                 - blocklist: el prompt coincide con blocklist1.
+                 - prompt_shield: Prompt Shield detecto un ataque.
+                 - salida_del_modelo_probable: el prompt paso todos los
+                   controles, asi que lo mas probable es que bloqueara la
+                   validacion de la respuesta. Se deduce por descarte.
+                 - no_determinada: alguna consulta de diagnostico fallo.
+
+            Los atributos con codigo usan comillas simples como delimitador y
+            escapan < > & como &lt; &gt; &amp;. Los <set-body> van en CDATA.
+        -->
+        <choose>
+            <when condition='@(context.LastError != null &amp;&amp; ((context.LastError.Source ?? string.Empty).IndexOf("content-safety", StringComparison.OrdinalIgnoreCase) &gt;= 0 || (context.LastError.Message ?? string.Empty).IndexOf("content safety", StringComparison.OrdinalIgnoreCase) &gt;= 0) &amp;&amp; (context.LastError.Message ?? string.Empty).IndexOf("InternalError", StringComparison.OrdinalIgnoreCase) &lt; 0 &amp;&amp; (context.LastError.Message ?? string.Empty).IndexOf("Service unavailable", StringComparison.OrdinalIgnoreCase) &lt; 0 &amp;&amp; (context.LastError.Message ?? string.Empty).IndexOf("Please try again later", StringComparison.OrdinalIgnoreCase) &lt; 0)'>
+
+                <set-variable name="csRawMessage" value="@(context.LastError.Message ?? string.Empty)" />
+
+                <!-- Consulta 1: solo si el analisis previo del inbound fallo -->
+                <choose>
+                    <when condition='@(!context.Variables.ContainsKey("csAnalyzeResponse") || context.Variables["csAnalyzeResponse"] == null || ((IResponse)context.Variables["csAnalyzeResponse"]).StatusCode != 200)'>
+                        <send-request mode="new" response-variable-name="csAnalyzeResponse" timeout="8" ignore-error="true">
+                            <set-url>{content-safety-endpoint}contentsafety/text:analyze?api-version=2024-09-01</set-url>
+                            <set-method>POST</set-method>
+                            <set-header name="Content-Type" exists-action="override">
+                                <value>application/json</value>
+                            </set-header>
+                            <set-body><![CDATA[@{
+                                var textos = context.Variables.GetValueOrDefault<JObject>("csTextosPrompt", new JObject());
+                                var b = new JObject();
+                                b["text"] = (string)textos["conversacion"] ?? "";
+                                b["categories"] = new JArray("Hate", "SelfHarm", "Sexual", "Violence");
+                                b["outputType"] = "EightSeverityLevels";
+                                b["blocklistNames"] = new JArray("blocklist1");
+                                b["haltOnBlocklistHit"] = false;
+                                return b.ToString();
+                            }]]></set-body>
+                            <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+                        </send-request>
+                    </when>
+                </choose>
+
+                <!-- Consulta 2: Prompt Shield sobre el ultimo mensaje del usuario -->
+                <send-request mode="new" response-variable-name="csShieldResponse" timeout="8" ignore-error="true">
+                    <set-url>{content-safety-endpoint}contentsafety/text:shieldPrompt?api-version=2024-09-01</set-url>
+                    <set-method>POST</set-method>
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body><![CDATA[@{
+                        var textos = context.Variables.GetValueOrDefault<JObject>("csTextosPrompt", new JObject());
+                        var b = new JObject();
+                        b["userPrompt"] = (string)textos["ultimo_usuario"] ?? "";
+                        b["documents"] = new JArray();
+                        return b.ToString();
+                    }]]></set-body>
+                    <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+                </send-request>
+
+                <set-variable name="csDiagnostico" value='@{
+                    string categoria = "";
+                    int severidad = -1;
+                    var coincidencias = new JArray();
+                    bool ataque = false;
+                    bool analisisOk = false;
+                    bool shieldOk = false;
+                    var porCategoria = new JObject();
+
+                    try {
+                        IResponse resp = context.Variables.ContainsKey("csAnalyzeResponse") ? (IResponse)context.Variables["csAnalyzeResponse"] : null;
+                        if (resp != null &amp;&amp; resp.StatusCode == 200) {
+                            var json = resp.Body.As&lt;JObject&gt;(true);
+                            var analysis = json["categoriesAnalysis"] as JArray;
+                            if (analysis != null) {
+                                analisisOk = true;
+                                foreach (var item in analysis) {
+                                    int sev = (int)item["severity"];
+                                    string cat = (string)item["category"];
+                                    porCategoria[cat] = sev;
+                                    if (sev &gt; severidad) {
+                                        severidad = sev;
+                                        categoria = cat;
+                                    }
+                                }
+                            }
+                            var matches = json["blocklistsMatch"] as JArray;
+                            if (matches != null) {
+                                foreach (var m in matches) {
+                                    coincidencias.Add((string)m["blocklistItemText"]);
+                                }
+                            }
+                        }
+                    } catch {
+                    }
+
+                    try {
+                        IResponse shieldResp = context.Variables.ContainsKey("csShieldResponse") ? (IResponse)context.Variables["csShieldResponse"] : null;
+                        if (shieldResp != null &amp;&amp; shieldResp.StatusCode == 200) {
+                            var sj = shieldResp.Body.As&lt;JObject&gt;(true);
+                            var upa = sj["userPromptAnalysis"] as JObject;
+                            if (upa != null) {
+                                shieldOk = true;
+                                ataque = (bool)upa["attackDetected"];
+                            }
+                        }
+                    } catch {
+                    }
+
+                    var d = new JObject();
+                    d["categoria"] = categoria;
+                    d["severidad"] = severidad;
+                    d["blocklist"] = coincidencias;
+                    d["ataque"] = ataque;
+                    d["analisis_ok"] = analisisOk;
+                    d["shield_ok"] = shieldOk;
+                    d["por_categoria"] = porCategoria;
+                    return d;
+                }' />
+
+                <set-status code="403" reason="Blocked by Content Safety" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body><![CDATA[@{
+                  try {
+                    var d = (JObject)context.Variables["csDiagnostico"];
+                    string categoria = (string)d["categoria"];
+                    int severidad = (int)d["severidad"];
+                    var coincidencias = (JArray)d["blocklist"];
+                    bool ataque = (bool)d["ataque"];
+                    bool analisisOk = (bool)d["analisis_ok"];
+                    bool shieldOk = (bool)d["shield_ok"];
+                    var porCategoria = (JObject)d["por_categoria"];
+                    var mensajeOriginal = context.Variables.GetValueOrDefault<string>("csRawMessage", "");
+                    int umbralGlobal = 3;
+
+                    var nombresCategoria = new JObject();
+                    nombresCategoria["SelfHarm"] = "autolesion";
+                    nombresCategoria["Hate"] = "discurso de odio";
+                    nombresCategoria["Violence"] = "violencia";
+                    nombresCategoria["Sexual"] = "contenido sexual";
+
+                    // Mismos umbrales que los threshold de llm-content-safety (inbound)
+                    var umbrales = context.Variables.ContainsKey("csUmbrales") ? (JObject)context.Variables["csUmbrales"] : new JObject();
+                    if (umbrales["Hate"] == null) { umbrales["Hate"] = 2; }
+                    if (umbrales["Violence"] == null) { umbrales["Violence"] = 3; }
+                    if (umbrales["Sexual"] == null) { umbrales["Sexual"] = 3; }
+                    if (umbrales["SelfHarm"] == null) { umbrales["SelfHarm"] = 3; }
+
+                    bool superaUmbral = false;
+                    string categoriaCausa = "";
+                    int severidadCausa = -1;
+                    int umbralCausa = umbralGlobal;
+                    foreach (var prop in porCategoria.Properties()) {
+                        int sev = (int)prop.Value;
+                        int umbral = umbrales[prop.Name] != null ? (int)umbrales[prop.Name] : umbralGlobal;
+                        if (sev >= umbral && sev > severidadCausa) {
+                            superaUmbral = true;
+                            categoriaCausa = prop.Name;
+                            severidadCausa = sev;
+                            umbralCausa = umbral;
+                        }
+                    }
+                    string nombreLegible = superaUmbral ? (nombresCategoria[categoriaCausa]?.ToString() ?? categoriaCausa) : "";
+
+                    bool hayBlocklist = coincidencias.Count > 0;
+                    bool diagnosticoCompleto = analisisOk && shieldOk;
+
+                    var causas = new JArray();
+                    if (superaUmbral) {
+                        causas.Add("categoria_entrada");
+                    }
+                    if (hayBlocklist) {
+                        causas.Add("blocklist");
+                    }
+                    if (ataque) {
+                        causas.Add("prompt_shield");
+                    }
+                    if (causas.Count == 0) {
+                        if (diagnosticoCompleto) {
+                            causas.Add("salida_del_modelo_probable");
+                        } else {
+                            causas.Add("no_determinada");
+                        }
+                    }
+                    string causaPrincipal = (string)causas[0];
+
+                    string nivelTexto = analisisOk
+                        ? $" Nivel maximo detectado en la entrada: {severidad} en \"{(nombresCategoria[categoria]?.ToString() ?? categoria)}\" (escala 0-7, umbral {(umbrales[categoria] != null ? (int)umbrales[categoria] : umbralGlobal)})."
+                        : "";
+
+                    string mensajeProfesional;
+                    if (causaPrincipal == "categoria_entrada") {
+                        mensajeProfesional = $"Tu solicitud fue bloqueada porque el contenido evaluado alcanzo un nivel de severidad {severidadCausa} en la categoria \"{nombreLegible}\", igual o superior al umbral de {umbralCausa} configurado en la politica de seguridad de contenido de este servicio.";
+                    } else if (causaPrincipal == "blocklist") {
+                        mensajeProfesional = "Tu solicitud fue bloqueada porque contiene un termino de la lista de bloqueo (blocklist1) configurada en la politica de seguridad de este servicio." + nivelTexto;
+                    } else if (causaPrincipal == "prompt_shield") {
+                        mensajeProfesional = "Tu solicitud fue bloqueada por Prompt Shield: se detecto un intento de manipular o saltarse las instrucciones del modelo." + nivelTexto;
+                    } else if (causaPrincipal == "salida_del_modelo_probable") {
+                        mensajeProfesional = "Tu solicitud no alcanza ningun umbral ni activa la blocklist ni Prompt Shield, pero el gateway la bloqueo. Lo mas probable es que la respuesta generada por el modelo haya alcanzado el umbral en la validacion de salida. Esta causa se deduce por descarte y no se puede confirmar directamente." + nivelTexto;
+                    } else {
+                        mensajeProfesional = "Tu solicitud fue bloqueada por el filtro de seguridad de contenido de Azure AI Content Safety. No fue posible determinar la causa exacta porque fallo alguna de las consultas de diagnostico; el detalle original de Azure queda incluido para referencia.";
+                    }
+
+                    var maxEntrada = new JObject();
+                    maxEntrada["categoria"] = string.IsNullOrEmpty(categoria) ? "No determinada" : categoria;
+                    maxEntrada["severidad"] = severidad;
+
+                    var body = new JObject();
+                    body["blocked"] = true;
+                    body["gateway"] = "APIM Content Safety Gateway";
+                    body["mensaje"] = mensajeProfesional;
+                    body["causa_bloqueo"] = causaPrincipal;
+                    body["causas_detectadas"] = causas;
+                    body["categoria_detectada"] = superaUmbral ? categoriaCausa : "No determinada";
+                    body["severidad_detectada"] = superaUmbral ? severidadCausa.ToString() : "No determinada";
+                    body["severidad_maxima_entrada"] = maxEntrada;
+                    body["severidades_por_categoria"] = porCategoria;
+                    body["blocklist_coincidencias"] = coincidencias;
+                    body["prompt_shield_ataque"] = ataque;
+                    body["diagnostico_completo"] = diagnosticoCompleto;
+                    body["nivel_riesgo"] = context.Variables.GetValueOrDefault<string>("csNivel", "");
+                    body["modelo_enrutado"] = context.Variables.GetValueOrDefault<string>("modeloDestino", "");
+                    body["escala_severidad"] = "EightSeverityLevels: 0 (nada) a 7 (extremo). Se bloquea cuando la severidad es igual o mayor al umbral de su categoria.";
+                    body["umbrales_configurados"] = umbrales;
+                    body["detalle_original_azure"] = mensajeOriginal;
+                    body["error_source"] = context.LastError?.Source ?? "";
+                    body["error_reason"] = context.LastError?.Reason ?? "";
+
+                    return body.ToString();
+                  } catch (Exception ex) {
+                    var fallback = new JObject();
+                    fallback["blocked"] = true;
+                    fallback["gateway"] = "APIM Content Safety Gateway";
+                    fallback["mensaje"] = "Tu solicitud fue bloqueada por Azure AI Content Safety. No fue posible calcular el diagnostico de la causa.";
+                    fallback["causa_bloqueo"] = "no_determinada";
+                    fallback["causas_detectadas"] = new JArray("no_determinada");
+                    fallback["diagnostico_completo"] = false;
+                    fallback["detalle_original_azure"] = context.LastError?.Message ?? "";
+                    fallback["error_source"] = context.LastError?.Source ?? "";
+                    fallback["error_reason"] = context.LastError?.Reason ?? "";
+                    fallback["error_diagnostico"] = ex.Message;
+                    return fallback.ToString();
+                  }
+                }]]></set-body>
+            </when>
+            <when condition='@(context.LastError != null &amp;&amp; ((context.LastError.Source ?? string.Empty).IndexOf("content-safety", StringComparison.OrdinalIgnoreCase) &gt;= 0 || (context.LastError.Message ?? string.Empty).IndexOf("content safety", StringComparison.OrdinalIgnoreCase) &gt;= 0))'>
+                <set-status code="503" reason="Content Safety service temporarily unavailable" />
+                <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                </set-header>
+                <set-body><![CDATA[@{
+                    var body = new JObject();
+                    body["blocked"] = false;
+                    body["servicio_no_disponible"] = true;
+                    body["gateway"] = "APIM Content Safety Gateway";
+                    body["mensaje"] = "El servicio de Azure AI Content Safety no respondió (error transitorio o blocklist1 inexistente en el recurso; no es un bloqueo de contenido). Reintenta en unos segundos y, si persiste, verifica que blocklist1 exista.";
+                    body["detalle_original_azure"] = context.LastError.Message ?? string.Empty;
+                    return body.ToString();
+                }]]></set-body>
+            </when>
+            <otherwise>
+            </otherwise>
+        </choose>
+
+    </on-error>
+</policies>
